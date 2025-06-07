@@ -2,14 +2,14 @@ import os
 import asyncio
 import aiohttp
 import logging
-from flask import Flask, request, jsonify
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 from urllib.parse import quote, urljoin
-import threading
 import time
+import signal
+import sys
 
 # Configuration du logging
 logging.basicConfig(
@@ -24,194 +24,262 @@ class TelegramGroupSearcher:
         self.session = None
         
     async def create_session(self):
-        """Crée une session HTTP avec headers personnalisés"""
+        """Crée une session HTTP robuste"""
         if not self.session or self.session.closed:
             connector = aiohttp.TCPConnector(
-                limit=10,
-                limit_per_host=5,
+                limit=20,
+                limit_per_host=10,
                 ttl_dns_cache=300,
                 use_dns_cache=True,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
             )
-            timeout = aiohttp.ClientTimeout(total=20, connect=10)
+            timeout = aiohttp.ClientTimeout(total=25, connect=10)
+            
             self.session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
                 headers={
                     'User-Agent': self.ua.random,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Cache-Control': 'no-cache',
-                    'Pragma': 'no-cache'
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
                 }
             )
     
     async def search_tlgrm_eu(self, keyword):
-        """Recherche sur tlgrm.eu avec gestion d'erreurs améliorée"""
+        """Recherche sur tlgrm.eu"""
         results = []
         try:
             await self.create_session()
             url = f"https://tlgrm.eu/search?q={quote(keyword)}"
+            logger.info(f"Recherche sur tlgrm.eu: {url}")
+            
+            async with self.session.get(url) as response:
+                logger.info(f"Status tlgrm.eu: {response.status}")
+                if response.status == 200:
+                    text = await response.text()
+                    soup = BeautifulSoup(text, 'html.parser')
+                    
+                    # Plusieurs sélecteurs possibles
+                    for selector in ['div.result-item', 'div.search-result', '.channel-card', 'div.group-item']:
+                        items = soup.select(selector)
+                        if items:
+                            logger.info(f"Trouvé {len(items)} items avec {selector}")
+                            break
+                    
+                    for item in items[:8]:
+                        try:
+                            # Chercher le titre
+                            title_elem = (item.find('h3') or item.find('h4') or 
+                                        item.find('span', class_='title') or 
+                                        item.find('a') or item.find('strong'))
+                            
+                            # Chercher le lien
+                            link_elem = item.find('a', href=True)
+                            
+                            if title_elem and link_elem:
+                                title = title_elem.get_text(strip=True)
+                                link = link_elem['href']
+                                
+                                if not link.startswith('http'):
+                                    link = urljoin('https://tlgrm.eu', link)
+                                
+                                if title and len(title) > 2:
+                                    results.append({
+                                        'title': title,
+                                        'link': link,
+                                        'source': 'tlgrm.eu'
+                                    })
+                        except Exception as e:
+                            logger.warning(f"Erreur item tlgrm.eu: {e}")
+                            continue
+                            
+        except Exception as e:
+            logger.error(f"Erreur tlgrm.eu: {e}")
+        
+        logger.info(f"tlgrm.eu: {len(results)} résultats")
+        return results
+    
+    async def search_tgstat(self, keyword):
+        """Recherche sur tgstat.com"""
+        results = []
+        try:
+            await self.create_session()
+            url = f"https://tgstat.com/search?q={quote(keyword)}"
+            logger.info(f"Recherche sur tgstat: {url}")
+            
+            async with self.session.get(url) as response:
+                logger.info(f"Status tgstat: {response.status}")
+                if response.status == 200:
+                    text = await response.text()
+                    soup = BeautifulSoup(text, 'html.parser')
+                    
+                    # Chercher les éléments de résultat
+                    for selector in ['div.channel-card', 'div.search-result', '.result-item']:
+                        items = soup.select(selector)
+                        if items:
+                            logger.info(f"Trouvé {len(items)} items tgstat avec {selector}")
+                            break
+                    
+                    for item in items[:8]:
+                        try:
+                            title_elem = (item.find('div', class_='channel-title') or 
+                                        item.find('h3') or item.find('a'))
+                            link_elem = item.find('a', href=True)
+                            
+                            if title_elem and link_elem:
+                                title = title_elem.get_text(strip=True)
+                                link = link_elem['href']
+                                
+                                if not link.startswith('http'):
+                                    link = urljoin('https://tgstat.com', link)
+                                
+                                if title and len(title) > 2:
+                                    results.append({
+                                        'title': title,
+                                        'link': link,
+                                        'source': 'tgstat'
+                                    })
+                        except Exception as e:
+                            logger.warning(f"Erreur item tgstat: {e}")
+                            continue
+                            
+        except Exception as e:
+            logger.error(f"Erreur tgstat: {e}")
+        
+        logger.info(f"tgstat: {len(results)} résultats")
+        return results
+    
+    async def search_direct_telegram(self, keyword):
+        """Recherche directe sur Telegram"""
+        results = []
+        try:
+            await self.create_session()
+            
+            # Créer des variations intelligentes
+            base_variations = [
+                keyword.lower().replace(' ', ''),
+                keyword.lower().replace(' ', '_'),
+                keyword.replace(' ', ''),
+                f"{keyword.lower()}group",
+                f"{keyword.lower()}chat",
+                keyword.lower()
+            ]
+            
+            # Nettoyer et limiter les variations
+            variations = []
+            for v in base_variations:
+                if len(v) >= 3 and v.isalnum() or '_' in v:
+                    variations.append(v)
+            
+            variations = list(set(variations))[:6]  # Max 6 variations
+            logger.info(f"Variations directes: {variations}")
+            
+            for variation in variations:
+                try:
+                    url = f"https://t.me/{variation}"
+                    async with self.session.head(url, allow_redirects=True) as response:
+                        if response.status == 200:
+                            results.append({
+                                'title': f"@{variation}",
+                                'link': url,
+                                'source': 'direct'
+                            })
+                            logger.info(f"Trouvé direct: @{variation}")
+                            
+                except Exception:
+                    continue
+                    
+                if len(results) >= 4:
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Erreur recherche directe: {e}")
+        
+        logger.info(f"Direct: {len(results)} résultats")
+        return results
+    
+    async def search_lyzem(self, keyword):
+        """Recherche sur lyzem.com"""
+        results = []
+        try:
+            await self.create_session()
+            url = f"https://lyzem.com/search?q={quote(keyword)}"
+            logger.info(f"Recherche sur lyzem: {url}")
             
             async with self.session.get(url) as response:
                 if response.status == 200:
                     text = await response.text()
                     soup = BeautifulSoup(text, 'html.parser')
                     
-                    # Chercher différents sélecteurs possibles
-                    selectors = [
-                        'div.result-item',
-                        'div.search-result',
-                        'div.channel-item',
-                        '.result'
-                    ]
-                    
-                    items_found = []
-                    for selector in selectors:
-                        items_found = soup.select(selector)
-                        if items_found:
-                            break
-                    
-                    for item in items_found[:8]:
-                        title_elem = (item.find('h3') or 
-                                    item.find('h4') or 
-                                    item.find('a') or 
-                                    item.find('span', class_='title'))
-                        
-                        link_elem = item.find('a', href=True)
-                        
-                        if title_elem and link_elem:
-                            title = title_elem.get_text(strip=True)
-                            link = link_elem['href']
+                    # Recherche de liens Telegram
+                    links = soup.find_all('a', href=True)
+                    for link in links:
+                        href = link['href']
+                        if 't.me/' in href and len(results) < 5:
+                            title = link.get_text(strip=True)
+                            if not title:
+                                title = href.split('/')[-1]
                             
-                            if not link.startswith('http'):
-                                link = urljoin('https://tlgrm.eu', link)
-                            
-                            if title and link:
-                                results.append({'title': title, 'link': link, 'source': 'tlgrm.eu'})
-                                
-        except asyncio.TimeoutError:
-            logger.warning("Timeout sur tlgrm.eu")
-        except Exception as e:
-            logger.error(f"Erreur tlgrm.eu: {e}")
-        
-        return results
-    
-    async def search_telegram_direct(self, keyword):
-        """Recherche directe sur Telegram avec variations intelligentes"""
-        results = []
-        try:
-            await self.create_session()
-            
-            # Créer des variations du mot-clé
-            variations = [
-                keyword.lower().replace(' ', ''),
-                keyword.lower().replace(' ', '_'),
-                keyword.replace(' ', ''),
-                f"{keyword}group",
-                f"{keyword}chat",
-                keyword.lower()
-            ]
-            
-            # Supprimer les doublons
-            variations = list(set(variations))
-            
-            for variation in variations[:5]:  # Limiter à 5 variations
-                if len(variation) > 2:  # Éviter les mots trop courts
-                    url = f"https://t.me/{variation}"
-                    try:
-                        async with self.session.get(url, allow_redirects=False) as response:
-                            if response.status in [200, 301, 302]:
+                            if title and len(title) > 2:
                                 results.append({
-                                    'title': f"@{variation}",
-                                    'link': url,
-                                    'source': 'direct'
+                                    'title': title[:50],
+                                    'link': href if href.startswith('http') else f"https://t.me/{href.split('/')[-1]}",
+                                    'source': 'lyzem'
                                 })
                                 
-                    except Exception:
-                        continue  # Ignorer les erreurs individuelles
-                        
-                    if len(results) >= 3:
-                        break
-                        
         except Exception as e:
-            logger.error(f"Erreur recherche directe: {e}")
-            
-        return results
-    
-    async def search_alternative_sources(self, keyword):
-        """Recherche sur des sources alternatives"""
-        results = []
-        try:
-            await self.create_session()
-            
-            # Sources alternatives simples
-            search_urls = [
-                f"https://lyzem.com/search?q={quote(keyword)}",
-                f"https://telegramic.org/search?q={quote(keyword)}"
-            ]
-            
-            for url in search_urls:
-                try:
-                    async with self.session.get(url) as response:
-                        if response.status == 200:
-                            text = await response.text()
-                            soup = BeautifulSoup(text, 'html.parser')
-                            
-                            # Recherche générique de liens Telegram
-                            links = soup.find_all('a', href=True)
-                            for link in links:
-                                href = link['href']
-                                if 't.me/' in href and len(results) < 5:
-                                    title = link.get_text(strip=True) or href.split('/')[-1]
-                                    if title and len(title) > 2:
-                                        results.append({
-                                            'title': title[:50],
-                                            'link': href,
-                                            'source': 'alternative'
-                                        })
-                                        
-                except Exception:
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Erreur sources alternatives: {e}")
-            
+            logger.error(f"Erreur lyzem: {e}")
+        
+        logger.info(f"lyzem: {len(results)} résultats")
         return results
     
     async def comprehensive_search(self, keyword):
-        """Effectue une recherche complète avec timeout et gestion d'erreurs"""
-        await self.create_session()
+        """Recherche complète avec toutes les sources"""
+        logger.info(f"=== Début recherche pour: '{keyword}' ===")
         
         try:
-            # Lancer les recherches avec timeout
-            tasks = [
-                asyncio.wait_for(self.search_tlgrm_eu(keyword), timeout=15),
-                asyncio.wait_for(self.search_telegram_direct(keyword), timeout=10),
-                asyncio.wait_for(self.search_alternative_sources(keyword), timeout=15)
+            # Lancer toutes les recherches en parallèle avec timeout
+            search_tasks = [
+                asyncio.wait_for(self.search_tlgrm_eu(keyword), timeout=20),
+                asyncio.wait_for(self.search_tgstat(keyword), timeout=20),
+                asyncio.wait_for(self.search_direct_telegram(keyword), timeout=15),
+                asyncio.wait_for(self.search_lyzem(keyword), timeout=20)
             ]
             
-            results_lists = await asyncio.gather(*tasks, return_exceptions=True)
+            results_lists = await asyncio.gather(*search_tasks, return_exceptions=True)
             
-            # Combiner tous les résultats valides
+            # Combiner tous les résultats
             all_results = []
-            for results in results_lists:
+            for i, results in enumerate(results_lists):
                 if isinstance(results, list):
                     all_results.extend(results)
+                    logger.info(f"Source {i}: {len(results)} résultats")
                 elif isinstance(results, Exception):
-                    logger.warning(f"Une recherche a échoué: {results}")
+                    logger.warning(f"Source {i} a échoué: {results}")
             
-            # Supprimer les doublons basés sur le lien
+            # Supprimer les doublons
             unique_results = []
             seen_links = set()
+            seen_titles = set()
             
             for result in all_results:
-                link_key = result['link'].lower().strip('/')
-                if link_key not in seen_links and len(unique_results) < 15:
+                link_key = result['link'].lower().rstrip('/')
+                title_key = result['title'].lower().strip()
+                
+                if link_key not in seen_links and title_key not in seen_titles:
                     unique_results.append(result)
                     seen_links.add(link_key)
+                    seen_titles.add(title_key)
+                    
+                    if len(unique_results) >= 20:
+                        break
             
-            logger.info(f"Trouvé {len(unique_results)} résultats pour '{keyword}'")
+            logger.info(f"=== Résultat final: {len(unique_results)} résultats uniques ===")
             return unique_results
             
         except Exception as e:
@@ -219,326 +287,334 @@ class TelegramGroupSearcher:
             return []
     
     async def close_session(self):
-        """Ferme la session HTTP proprement"""
+        """Ferme la session HTTP"""
         if self.session and not self.session.closed:
             await self.session.close()
+            logger.info("Session HTTP fermée")
 
-# Instance globale du chercheur
+# Instance globale
 searcher = TelegramGroupSearcher()
 
-# Flask app pour les webhooks
-app = Flask(__name__)
-
-# Variables globales
-telegram_app = None
-bot_instance = None
-
-@app.route('/')
-def health_check():
-    """Health check pour Render"""
-    return jsonify({
-        "status": "running",
-        "bot": "Telegram Group Searcher",
-        "version": "2.0"
-    })
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Gestionnaire de webhook Telegram amélioré"""
-    try:
-        json_data = request.get_json(force=True)
-        if not json_data:
-            return "No data", 400
-            
-        update = Update.de_json(json_data, bot_instance)
-        
-        # Traiter l'update dans un thread séparé pour éviter les timeouts
-        def process_update():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(telegram_app.process_update(update))
-                loop.close()
-            except Exception as e:
-                logger.error(f"Erreur traitement update: {e}")
-        
-        threading.Thread(target=process_update, daemon=True).start()
-        return "OK"
-        
-    except Exception as e:
-        logger.error(f"Erreur webhook: {e}")
-        return "Error", 500
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /start améliorée"""
+    """Commande /start"""
+    user = update.effective_user
+    logger.info(f"Commande /start par {user.first_name} (ID: {user.id})")
+    
     welcome_msg = """🤖 **Bot de Recherche de Groupes Telegram**
 
-Bienvenue ! Je peux vous aider à trouver des groupes Telegram.
+Salut ! Je peux t'aider à trouver des groupes Telegram sur n'importe quel sujet.
 
-**Commandes disponibles:**
-• `/search <mot-clé>` - Rechercher des groupes
-• `/help` - Afficher l'aide complète
+**🔍 Comment utiliser :**
+`/search <ton mot-clé>`
 
-**Exemples:**
-• `/search musique`
+**💡 Exemples :**
+• `/search musique` 
 • `/search crypto bitcoin`
 • `/search france`
-• `/search gaming`
+• `/search gaming esport`
+• `/search technologie`
 
-✨ Je recherche sur plusieurs sources pour vous donner les meilleurs résultats !"""
+**✨ Fonctionnalités :**
+✅ Recherche sur plusieurs sources
+✅ Résultats en temps réel
+✅ Liens directs vers les groupes
+✅ Jusqu'à 20 résultats par recherche
+
+Tape `/help` pour plus d'infos !"""
 
     try:
         await update.message.reply_text(welcome_msg, parse_mode='Markdown')
+        logger.info(f"Message de bienvenue envoyé à {user.first_name}")
     except Exception as e:
-        logger.error(f"Erreur commande start: {e}")
-        await update.message.reply_text("Bot démarré ! Utilisez /search <mot-clé> pour rechercher.")
+        logger.error(f"Erreur envoi message start: {e}")
+        await update.message.reply_text("🤖 Bot démarré ! Utilise /search <mot-clé> pour chercher des groupes.")
 
 async def search_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /search améliorée avec gestion d'erreurs robuste"""
+    """Commande /search"""
+    user = update.effective_user
+    logger.info(f"Commande /search par {user.first_name} (ID: {user.id})")
+    
     try:
+        # Vérifier les arguments
         if not context.args:
             await update.message.reply_text(
-                "❌ **Utilisation:** `/search <mot-clé>`\n\n"
-                "**Exemples:**\n"
+                "❌ **Utilisation incorrecte**\n\n"
+                "**Format correct :** `/search <mot-clé>`\n\n"
+                "**Exemples :**\n"
                 "• `/search musique`\n"
                 "• `/search crypto`\n"
-                "• `/search france`",
+                "• `/search france`\n"
+                "• `/search gaming`",
                 parse_mode='Markdown'
             )
             return
         
         keyword = ' '.join(context.args).strip()
+        logger.info(f"Recherche demandée: '{keyword}' par {user.first_name}")
         
         if len(keyword) < 2:
             await update.message.reply_text("❌ Le mot-clé doit contenir au moins 2 caractères.")
             return
         
+        if len(keyword) > 50:
+            await update.message.reply_text("❌ Le mot-clé est trop long (max 50 caractères).")
+            return
+        
         # Message de chargement
         loading_msg = await update.message.reply_text(
-            f"🔍 **Recherche en cours...**\n"
-            f"Mot-clé: `{keyword}`\n"
-            f"⏳ Cela peut prendre quelques secondes...",
+            f"🔍 **Recherche en cours...**\n\n"
+            f"**Mot-clé :** `{keyword}`\n"
+            f"**Statut :** Recherche sur plusieurs sources...\n"
+            f"⏳ Patiente quelques secondes...",
             parse_mode='Markdown'
         )
+        
+        start_time = time.time()
         
         # Effectuer la recherche
         results = await searcher.comprehensive_search(keyword)
         
+        search_time = round(time.time() - start_time, 2)
+        logger.info(f"Recherche terminée en {search_time}s: {len(results)} résultats")
+        
+        # Traiter les résultats
         if not results:
             await loading_msg.edit_text(
                 f"❌ **Aucun résultat trouvé**\n\n"
-                f"Mot-clé recherché: `{keyword}`\n\n"
-                f"💡 **Suggestions:**\n"
-                f"• Essayez des mots-clés plus généraux\n"
-                f"• Utilisez des termes en anglais\n"
-                f"• Vérifiez l'orthographe",
+                f"**Mot-clé :** `{keyword}`\n"
+                f"**Temps de recherche :** {search_time}s\n\n"
+                f"💡 **Suggestions :**\n"
+                f"• Essaie des mots-clés plus généraux\n"
+                f"• Utilise des termes en anglais\n"
+                f"• Vérifie l'orthographe\n"
+                f"• Essaie des synonymes",
                 parse_mode='Markdown'
             )
             return
         
-        # Formater les résultats
-        response = f"🎯 **Résultats pour:** `{keyword}`\n"
-        response += f"📊 **{len(results)} groupe(s) trouvé(s)**\n\n"
+        # Formater la réponse
+        header = (
+            f"🎯 **Résultats pour :** `{keyword}`\n"
+            f"📊 **{len(results)} groupe(s) trouvé(s)** en {search_time}s\n\n"
+        )
         
-        for i, result in enumerate(results, 1):
-            title = result['title']
-            if len(title) > 45:
-                title = title[:42] + "..."
+        # Grouper par source pour un meilleur affichage
+        by_source = {}
+        for result in results:
+            source = result.get('source', 'unknown')
+            if source not in by_source:
+                by_source[source] = []
+            by_source[source].append(result)
+        
+        content = ""
+        counter = 1
+        
+        # Afficher les résultats par source
+        source_emojis = {
+            'direct': '🔗',
+            'tlgrm.eu': '🌐',
+            'tgstat': '📊',
+            'lyzem': '🔍'
+        }
+        
+        for source, source_results in by_source.items():
+            emoji = source_emojis.get(source, '📱')
             
-            source_emoji = "🔗" if result.get('source') == 'direct' else "🌐"
-            response += f"{source_emoji} **{i}.** {title}\n"
-            response += f"   {result['link']}\n\n"
+            for result in source_results:
+                title = result['title']
+                if len(title) > 40:
+                    title = title[:37] + "..."
+                
+                content += f"{emoji} **{counter}.** {title}\n"
+                content += f"     {result['link']}\n\n"
+                counter += 1
         
-        response += "💡 Cliquez sur les liens pour rejoindre les groupes !"
+        footer = "💡 **Clique sur les liens pour rejoindre les groupes !**"
+        full_response = header + content + footer
         
         # Gérer les messages trop longs
-        if len(response) > 4000:
+        if len(full_response) > 4000:
             # Diviser en chunks
-            header = f"🎯 **Résultats pour:** `{keyword}`\n📊 **{len(results)} groupe(s) trouvé(s)**\n\n"
+            await loading_msg.edit_text(header, parse_mode='Markdown')
             
-            chunks = [header]
             current_chunk = ""
+            chunk_counter = 1
             
-            for i, result in enumerate(results, 1):
-                title = result['title']
-                if len(title) > 45:
-                    title = title[:42] + "..."
+            for source, source_results in by_source.items():
+                emoji = source_emojis.get(source, '📱')
                 
-                source_emoji = "🔗" if result.get('source') == 'direct' else "🌐"
-                item = f"{source_emoji} **{i}.** {title}\n   {result['link']}\n\n"
-                
-                if len(current_chunk + item) > 3500:
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                    current_chunk = item
-                else:
-                    current_chunk += item
+                for result in source_results:
+                    title = result['title']
+                    if len(title) > 40:
+                        title = title[:37] + "..."
+                    
+                    item = f"{emoji} **{chunk_counter}.** {title}\n     {result['link']}\n\n"
+                    
+                    if len(current_chunk + item) > 3800:
+                        if current_chunk:
+                            await update.message.reply_text(current_chunk, parse_mode='Markdown')
+                        current_chunk = item
+                    else:
+                        current_chunk += item
+                    
+                    chunk_counter += 1
             
             if current_chunk:
-                chunks.append(current_chunk + "💡 Cliquez sur les liens pour rejoindre les groupes !")
-            
-            # Envoyer les chunks
-            await loading_msg.edit_text(chunks[0], parse_mode='Markdown')
-            
-            for chunk in chunks[1:]:
-                await update.message.reply_text(chunk, parse_mode='Markdown')
+                await update.message.reply_text(current_chunk + footer, parse_mode='Markdown')
         else:
-            await loading_msg.edit_text(response, parse_mode='Markdown')
-            
+            await loading_msg.edit_text(full_response, parse_mode='Markdown')
+        
+        logger.info(f"Résultats envoyés à {user.first_name}")
+        
     except Exception as e:
-        logger.error(f"Erreur lors de la recherche: {e}")
+        logger.error(f"Erreur dans search_groups: {e}")
         try:
             await update.message.reply_text(
-                f"❌ **Erreur lors de la recherche**\n\n"
-                f"Une erreur s'est produite. Veuillez réessayer dans quelques instants.\n\n"
-                f"Si le problème persiste, contactez l'administrateur.",
+                f"❌ **Erreur de recherche**\n\n"
+                f"Une erreur s'est produite pendant la recherche.\n"
+                f"Réessaie dans quelques instants.\n\n"
+                f"Si le problème persist, contacte l'admin.",
                 parse_mode='Markdown'
             )
-        except Exception:
-            await update.message.reply_text("❌ Erreur lors de la recherche. Veuillez réessayer.")
+        except Exception as e2:
+            logger.error(f"Erreur envoi message d'erreur: {e2}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commande /help"""
-    help_text = """🆘 **Aide - Bot de Recherche Telegram**
+    user = update.effective_user
+    logger.info(f"Commande /help par {user.first_name}")
+    
+    help_text = """🆘 **Guide d'utilisation**
 
-**📋 Commandes disponibles:**
+**📋 Commandes disponibles :**
 • `/start` - Démarrer le bot
 • `/search <mot-clé>` - Rechercher des groupes
 • `/help` - Afficher cette aide
 
-**🔍 Exemples de recherche:**
-• `/search musique` - Groupes de musique
-• `/search crypto bitcoin` - Groupes crypto
-• `/search france paris` - Groupes français
-• `/search gaming` - Groupes de jeux
-• `/search tech programming` - Groupes tech
+**🔍 Exemples de recherche :**
+• `/search musique rock` - Groupes de musique rock
+• `/search crypto bitcoin` - Groupes crypto/Bitcoin
+• `/search france paris` - Groupes français/parisiens
+• `/search gaming fortnite` - Groupes gaming
+• `/search tech programming` - Groupes tech/dev
+• `/search anime manga` - Groupes anime/manga
 
-**⚡ Fonctionnalités:**
-✅ Recherche sur plusieurs sources
-✅ Résultats rapides et précis
-✅ Liens directs vers les groupes
+**⚡ Fonctionnalités :**
+✅ Recherche simultanée sur 4+ sources
+✅ Résultats en temps réel (5-15 secondes)
+✅ Jusqu'à 20 groupes par recherche
+✅ Liens directs cliquables
 ✅ Recherche en français et anglais
 
-**💡 Conseils:**
-• Utilisez des mots-clés précis
-• Essayez en anglais pour plus de résultats
-• Combinez plusieurs mots-clés
+**💡 Conseils pour de meilleurs résultats :**
+• Utilise des mots-clés précis mais pas trop spécifiques
+• Combine plusieurs mots pour affiner la recherche
+• Essaie en anglais pour plus de résultats internationaux
+• Utilise des termes populaires (crypto, gaming, music, etc.)
 
-**🔧 Support:** En cas de problème, contactez l'administrateur."""
+**🔧 En cas de problème :**
+• Vérifie l'orthographe de tes mots-clés
+• Essaie des synonymes ou termes similaires
+• Attends quelques secondes entre les recherches
+• Contacte l'admin si ça ne fonctionne toujours pas
+
+**🚀 Prêt à chercher ? Utilise `/search <ton-mot-clé>` !**"""
 
     try:
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Erreur commande help: {e}")
-        await update.message.reply_text("Aide disponible : /start /search /help")
+        await update.message.reply_text("📋 Commandes: /start /search /help")
 
-async def setup_application():
-    """Configure l'application Telegram de manière asynchrone"""
-    global telegram_app, bot_instance
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestionnaire d'erreurs global"""
+    logger.error(f"Erreur non gérée: {context.error}")
     
+    if update and update.message:
+        try:
+            await update.message.reply_text(
+                "❌ Une erreur inattendue s'est produite. Réessaie plus tard."
+            )
+        except Exception:
+            pass
+
+def signal_handler(signum, frame):
+    """Gestionnaire de signaux pour arrêt propre"""
+    logger.info(f"Signal {signum} reçu, arrêt du bot...")
+    sys.exit(0)
+
+async def main():
+    """Fonction principale avec polling"""
+    logger.info("🚀 Démarrage du bot en mode polling...")
+    
+    # Récupérer le token
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    
     if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN non trouvé !")
-        return False
+        logger.error("❌ TELEGRAM_BOT_TOKEN non trouvé dans les variables d'environnement !")
+        return
+    
+    # Configurer les signaux
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        # Créer l'application avec une configuration robuste
-        telegram_app = (
+        # Créer l'application
+        application = (
             Application.builder()
             .token(TOKEN)
             .read_timeout(30)
             .write_timeout(30)
             .connect_timeout(30)
             .pool_timeout(30)
+            .get_updates_read_timeout(30)
+            .get_updates_write_timeout(30)
+            .get_updates_connect_timeout(30)
+            .get_updates_pool_timeout(30)
             .build()
         )
         
-        bot_instance = telegram_app.bot
+        # Ajouter les handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("search", search_groups))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_error_handler(error_handler)
         
-        # Ajouter les gestionnaires
-        telegram_app.add_handler(CommandHandler("start", start))
-        telegram_app.add_handler(CommandHandler("search", search_groups))
-        telegram_app.add_handler(CommandHandler("help", help_command))
+        logger.info("✅ Handlers ajoutés")
         
-        # Initialiser
-        await telegram_app.initialize()
-        await telegram_app.start()
+        # Test de connexion
+        try:
+            bot_info = await application.bot.get_me()
+            logger.info(f"✅ Bot connecté: @{bot_info.username} ({bot_info.first_name})")
+        except Exception as e:
+            logger.error(f"❌ Erreur de connexion au bot: {e}")
+            return
         
-        logger.info("✅ Application Telegram configurée avec succès !")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur configuration Telegram: {e}")
-        return False
-
-def setup_webhook():
-    """Configure le webhook Telegram"""
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-    
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN manquant")
-        return
-    
-    if not WEBHOOK_URL:
-        logger.warning("WEBHOOK_URL non défini, webhook non configuré")
-        return
-    
-    try:
-        import requests
-        
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        api_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
-        
-        response = requests.post(
-            api_url,
-            json={"url": webhook_url},
-            timeout=30
+        # Démarrer le polling
+        logger.info("🔄 Démarrage du polling...")
+        await application.run_polling(
+            poll_interval=1.0,
+            timeout=20,
+            bootstrap_retries=5,
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30,
+            pool_timeout=30,
+            drop_pending_updates=True
         )
         
-        if response.status_code == 200:
-            result = response.json()
-            if result.get('ok'):
-                logger.info(f"✅ Webhook configuré: {webhook_url}")
-            else:
-                logger.error(f"❌ Erreur webhook: {result}")
-        else:
-            logger.error(f"❌ Erreur HTTP webhook: {response.status_code}")
-            
-    except Exception as e:
-        logger.error(f"❌ Exception webhook: {e}")
-
-async def main_async():
-    """Fonction principale asynchrone"""
-    logger.info("🚀 Démarrage du bot...")
-    
-    success = await setup_application()
-    if not success:
-        logger.error("❌ Échec de la configuration")
-        return
-    
-    setup_webhook()
-    logger.info("✅ Bot prêt !")
-
-def main():
-    """Point d'entrée principal"""
-    try:
-        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("🛑 Arrêt demandé par l'utilisateur")
     except Exception as e:
         logger.error(f"❌ Erreur critique: {e}")
+    finally:
+        # Nettoyer
+        await searcher.close_session()
+        logger.info("🧹 Nettoyage terminé")
 
 if __name__ == '__main__':
-    # Configurer le bot
-    main()
-    
-    # Démarrer Flask
-    PORT = int(os.environ.get('PORT', 8000))
-    logger.info(f"🌐 Démarrage Flask sur le port {PORT}")
-    
-    app.run(
-        host='0.0.0.0',
-        port=PORT,
-        debug=False,
-        threaded=True
-    )
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Bot arrêté")
+    except Exception as e:
+        logger.error(f"❌ Erreur au démarrage: {e}")
