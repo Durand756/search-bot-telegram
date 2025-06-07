@@ -10,6 +10,7 @@ from urllib.parse import quote, urljoin
 import time
 import signal
 import sys
+import atexit
 
 # Configuration du logging
 logging.basicConfig(
@@ -538,14 +539,54 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+# Variables globales pour l'application
+application = None
+shutdown_event = None
+
+async def cleanup():
+    """Nettoyage des ressources"""
+    global application, searcher
+    
+    logger.info("🧹 Début du nettoyage...")
+    
+    try:
+        # Fermer la session de recherche
+        if searcher:
+            await searcher.close_session()
+            logger.info("✅ Session de recherche fermée")
+    except Exception as e:
+        logger.error(f"Erreur fermeture session searcher: {e}")
+    
+    try:
+        # Arrêter l'application Telegram proprement
+        if application:
+            if application.running:
+                await application.stop()
+                logger.info("✅ Application arrêtée")
+            
+            if application.updater and application.updater.running:
+                await application.updater.stop()
+                logger.info("✅ Updater arrêté")
+            
+            await application.shutdown()
+            logger.info("✅ Application fermée")
+    except Exception as e:
+        logger.error(f"Erreur fermeture application: {e}")
+    
+    logger.info("🧹 Nettoyage terminé")
+
 def signal_handler(signum, frame):
     """Gestionnaire de signaux pour arrêt propre"""
-    logger.info(f"Signal {signum} reçu, arrêt du bot...")
-    sys.exit(0)
+    global shutdown_event
+    logger.info(f"Signal {signum} reçu, demande d'arrêt...")
+    if shutdown_event:
+        shutdown_event.set()
 
 async def main():
-    """Fonction principale avec polling"""
-    logger.info("🚀 Démarrage du bot en mode polling...")
+    """Fonction principale avec polling amélioré"""
+    global application, shutdown_event
+    
+    logger.info("🚀 Démarrage du bot...")
     
     # Récupérer le token
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -553,12 +594,15 @@ async def main():
         logger.error("❌ TELEGRAM_BOT_TOKEN non trouvé dans les variables d'environnement !")
         return
     
+    # Créer l'événement d'arrêt
+    shutdown_event = asyncio.Event()
+    
     # Configurer les signaux
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        # Créer l'application
+        # Créer l'application avec timeouts configurés via ApplicationBuilder
         application = (
             Application.builder()
             .token(TOKEN)
@@ -581,6 +625,10 @@ async def main():
         
         logger.info("✅ Handlers ajoutés")
         
+        # Initialiser l'application
+        await application.initialize()
+        logger.info("✅ Application initialisée")
+        
         # Test de connexion
         try:
             bot_info = await application.bot.get_me()
@@ -589,32 +637,37 @@ async def main():
             logger.error(f"❌ Erreur de connexion au bot: {e}")
             return
         
-        # Démarrer le polling
-        logger.info("🔄 Démarrage du polling...")
-        await application.run_polling(
+        # Démarrer l'application
+        await application.start()
+        logger.info("✅ Application démarrée")
+        
+        # Démarrer l'updater
+        await application.updater.start_polling(
             poll_interval=1.0,
-            timeout=20,
             bootstrap_retries=5,
-            read_timeout=30,
-            write_timeout=30,
-            connect_timeout=30,
-            pool_timeout=30,
             drop_pending_updates=True
         )
+        logger.info("🔄 Polling démarré")
         
-    except KeyboardInterrupt:
-        logger.info("🛑 Arrêt demandé par l'utilisateur")
+        # Attendre le signal d'arrêt
+        logger.info("✅ Bot en fonctionnement, en attente...")
+        await shutdown_event.wait()
+        
     except Exception as e:
         logger.error(f"❌ Erreur critique: {e}")
     finally:
-        # Nettoyer
-        await searcher.close_session()
-        logger.info("🧹 Nettoyage terminé")
+        # Nettoyage propre
+        await cleanup()
+
+# Enregistrer la fonction de nettoyage pour l'arrêt
+atexit.register(lambda: asyncio.create_task(cleanup()) if asyncio.get_event_loop().is_running() else None)
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Bot arrêté")
+        logger.info("👋 Arrêt demandé par l'utilisateur")
     except Exception as e:
         logger.error(f"❌ Erreur au démarrage: {e}")
+    finally:
+        logger.info("👋 Bot arrêté")
