@@ -1,7 +1,28 @@
-aiohttp==3.9.1
-beautifulsoup4==4.12.2
-python-telegram-bot==20.7
+# Framework web asynchrone
 quart==0.19.4
+hypercorn==0.14.4
+
+# Client HTTP asynchrone
+aiohttp==3.9.1
+aiofiles==23.2.0
+
+# Parsing HTML
+beautifulsoup4==4.12.2
 lxml==4.9.3
-hypercorn==0.16.0
-gunicorn==20.1.0
+
+# Utilitaires
+python-dotenv==1.0.0
+requests==2.31.0
+
+# Logging et monitoring
+structlog==23.2.0
+
+# Sécurité et validation
+urllib3==2.1.0
+certifi==2023.11.17
+
+# Support des formats
+python-multipart==0.0.6
+
+# Optimisation
+uvloop==0.19.0; sys_platform != "win32"
