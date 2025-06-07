@@ -1,24 +1,18 @@
 services:
   - type: web
-    name: whatsapp-telegram-bot
+    name: telegram-search-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
     plan: free
-    region: frankfurt
-    branch: main
-    healthCheckPath: /health
+    buildCommand: "./build.sh"
+    startCommand: "./start.sh"
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: PORT
-        value: 8000
-      - key: HOST
-        value: 0.0.0.0
-      - key: WHATSAPP_API_URL
-        sync: false
-      - key: WHATSAPP_TOKEN
-        sync: false
-    scaling:
-      minInstances: 1
-      maxInstances: 1
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # Vous devrez définir ceci manuellement
+    autoDeploy: true
+    healthCheckPath: /
+    disk:
+      name: data
+      mountPath: /tmp
+      sizeGB: 1
