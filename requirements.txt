@@ -1,28 +1,10 @@
-# Framework web asynchrone
-quart==0.19.4
-hypercorn==0.14.4
-
-# Client HTTP asynchrone
-aiohttp==3.9.1
-aiofiles==23.2.0
-
-# Parsing HTML
+python-telegram-bot==20.7
+requests==2.31.0
 beautifulsoup4==4.12.2
 lxml==4.9.3
-
-# Utilitaires
+fake-useragent==1.4.0
+aiohttp==3.9.1
+asyncio-throttle==1.0.2
 python-dotenv==1.0.0
-requests==2.31.0
-
-# Logging et monitoring
-structlog==23.2.0
-
-# Sécurité et validation
-urllib3==2.1.0
-certifi==2023.11.17
-
-# Support des formats
-python-multipart==0.0.6
-
-# Optimisation
-uvloop==0.19.0; sys_platform != "win32"
+gunicorn==21.2.0
+flask==3.0.0
